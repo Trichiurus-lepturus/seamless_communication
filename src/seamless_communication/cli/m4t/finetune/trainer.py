@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the
 # MIT_LICENSE file in the root directory of this source tree.
 
-
 import logging
 import time
 from contextlib import contextmanager
@@ -43,13 +42,13 @@ class FinetuneMode(Enum):
 class FinetuneParams:
     model_name: str
     """Model name of model being finetuned."""
-    
+
     save_model_path: Path
     """Path were to save finetuned model."""
 
     finetune_mode: FinetuneMode = FinetuneMode.TEXT_TO_SPEECH
     """Allows to freeze S2T or T2U part of the model"""
-    
+
     float_dtype: torch.dtype = torch.float16
     """Float Dtype"""
 
@@ -80,6 +79,9 @@ class FinetuneParams:
 
     eval_batch_size: int = 5
     """The batch size during evaluation."""
+
+    grad_accum_steps: int = 1
+    """Number of steps to accumulate gradients before optimizer.step()"""
 
     device: Device = torch.device("cuda")
     """ Where to run computation"""
@@ -153,7 +155,7 @@ class UnitYFinetuneWrapper(nn.Module):
 
 
 class CalcLoss:
-    """Calculates negative log likelihood loss for S2T and T2U"""
+    """Fixed loss calculation for S2T and T2U with proper normalization"""
 
     def __init__(
         self,
@@ -165,41 +167,68 @@ class CalcLoss:
         self.s2t_vocab_info = s2t_vocab_info
         self.t2u_vocab_info = t2u_vocab_info
 
+        # Add debugging
+        logger.info(f"Loss calculation initialized with label_smoothing={label_smoothing}")
+
     def __call__(
         self,
         batch: dataloader.MultimodalSeqsBatch,
         text_logits: torch.Tensor,
         unit_logits: Optional[torch.Tensor],
     ) -> torch.Tensor:
+
+        # === S2T Loss Calculation ===
         assert batch.speech_to_text.target_lengths is not None
-        prefix_skip_len = 1  # language tokens to skip
-        s2t_numel = torch.sum(batch.speech_to_text.target_lengths - prefix_skip_len).to(
-            text_logits.device
-        )
         assert batch.speech_to_text.target_tokens is not None
-        s2t_loss = SequenceModelOutput(
-            logits=text_logits, vocab_info=self.s2t_vocab_info
-        ).compute_loss(
+
+        prefix_skip_len = 1  # Skip language token
+
+        # Calculate S2T loss using fairseq2's built-in method
+        s2t_sequence_output = SequenceModelOutput(
+            logits=text_logits,
+            vocab_info=self.s2t_vocab_info
+        )
+
+        # This returns the TOTAL loss (not per-token)
+        s2t_total_loss = s2t_sequence_output.compute_loss(
             targets=batch.speech_to_text.target_tokens.to(text_logits.device),
             ignore_prefix_size=prefix_skip_len,
             label_smoothing=self.label_smoothing,
         )
+
+        # Calculate the actual number of target tokens for proper normalization
+        target_lengths = batch.speech_to_text.target_lengths.to(text_logits.device)
+        s2t_num_tokens = torch.sum(torch.clamp(target_lengths - prefix_skip_len, min=1))
+
+        # CORRECT: Normalize by actual token count
+        s2t_loss_per_token = s2t_total_loss / s2t_num_tokens.float()
+
+        # For SPEECH_TO_TEXT mode, only return S2T loss
         if unit_logits is None:
-            return s2t_loss / s2t_numel
+            return s2t_loss_per_token
+
+        # === T2U Loss Calculation (if needed) ===
         assert batch.text_to_units.target_lengths is not None
-        s2u_numel = torch.sum(batch.text_to_units.target_lengths - prefix_skip_len).to(
-            unit_logits.device
-        )
         assert batch.text_to_units.target_tokens is not None
         assert self.t2u_vocab_info is not None
-        s2u_loss = SequenceModelOutput(
-            logits=unit_logits, vocab_info=self.t2u_vocab_info
-        ).compute_loss(
+
+        s2u_sequence_output = SequenceModelOutput(
+            logits=unit_logits,
+            vocab_info=self.t2u_vocab_info
+        )
+
+        s2u_total_loss = s2u_sequence_output.compute_loss(
             targets=batch.text_to_units.target_tokens.to(unit_logits.device),
             ignore_prefix_size=prefix_skip_len,
             label_smoothing=self.label_smoothing,
         )
-        return s2t_loss / s2t_numel + s2u_loss / s2u_numel
+
+        unit_target_lengths = batch.text_to_units.target_lengths.to(unit_logits.device)
+        s2u_num_tokens = torch.sum(torch.clamp(unit_target_lengths - prefix_skip_len, min=1))
+        s2u_loss_per_token = s2u_total_loss / s2u_num_tokens.float()
+
+        # Return combined loss (weighted equally)
+        return s2t_loss_per_token + s2u_loss_per_token
 
 
 class LossCollector:
@@ -241,6 +270,31 @@ class LossCollector:
         reduced = torch.sum(losses, dim=0).reshape(2).cpu()
         return reduced[0].item(), reduced[1].item()
 
+def debug_loss_calculation(calc_loss_fn, batch, text_logits, unit_logits=None):
+    """Debug loss calculation to ensure proper values"""
+
+    # Calculate loss components
+    with torch.no_grad():
+        loss = calc_loss_fn(batch, text_logits, unit_logits)
+
+        # Additional debugging
+        target_lengths = batch.speech_to_text.target_lengths
+        target_tokens = batch.speech_to_text.target_tokens
+
+        logger.info(f"Loss debugging:")
+        logger.info(f"  Final loss: {loss.item():.4f}")
+        logger.info(f"  Text logits shape: {text_logits.shape}")
+        logger.info(f"  Target tokens shape: {target_tokens.shape}")
+        logger.info(f"  Target lengths: {target_lengths}")
+        logger.info(f"  Batch size: {text_logits.shape[0]}")
+        logger.info(f"  Vocab size: {text_logits.shape[-1]}")
+
+        # Check for reasonable logit values
+        logit_mean = text_logits.mean().item()
+        logit_std = text_logits.std().item()
+        logger.info(f"  Logit statistics: mean={logit_mean:.3f}, std={logit_std:.3f}")
+
+        return loss
 
 class UnitYFinetune:
     def __init__(
@@ -259,17 +313,35 @@ class UnitYFinetune:
             if model.t2u_model is not None
             else None,
         )
-        
+
         self.model = self._wrap_model_for_trainining(model=model)
-        if freeze_modules:
+
+        # Check for manual LoRA implementation
+        self.has_lora = self._detect_lora_modules()
+        if self.has_lora:
+            logger.info("Detected manual LoRA implementation")
+
+        # Only apply freeze_modules if we're NOT using LoRA (since LoRA handles freezing)
+        if freeze_modules and not self.has_lora:
+            logger.info("Applying additional module freezing...")
             self._freeze_modules(freeze_modules)
-        
+        elif freeze_modules and self.has_lora:
+            logger.info("Skipping freeze_modules since LoRA already handles parameter freezing")
+
         self.train_data_loader = train_data_loader
         self.eval_data_loader = eval_data_loader
-        
-        self.grad_scaler = torch.cuda.amp.GradScaler()  # type: ignore
+
+        self.grad_scaler = torch.cuda.amp.GradScaler()
+
+        # CRITICAL: Only optimize parameters that require gradients
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        logger.info(f"Optimizer will train {len(trainable_params)} parameter tensors")
+
+        if len(trainable_params) == 0:
+            raise RuntimeError("No trainable parameters found! Check LoRA implementation.")
+
         self.optimizer = AdamW(
-            params=self.model.parameters(),
+            params=trainable_params,
             lr=self.params.learning_rate,
             betas=(0.9, 0.98),
             eps=1e-08,
@@ -277,6 +349,7 @@ class UnitYFinetune:
             weight_decay=0.0,
             fused=(self.params.device.type == "cuda"),
         )
+
         self.lr_scheduler = MyleLR(
             optimizer=self.optimizer,
             num_warmup_steps=self.params.warmup_steps,
@@ -290,6 +363,13 @@ class UnitYFinetune:
         self.best_eval_loss: Optional[float] = None
         self.is_best_state: bool = False
         torch.set_float32_matmul_precision("high")
+
+    def _detect_lora_modules(self) -> bool:
+        """Detect if the model has manual LoRA modules"""
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                return True
+        return False
 
     def _reset_stats(self) -> None:
         self.train_loss_hist.reset()
@@ -311,14 +391,19 @@ class UnitYFinetune:
             device_ids=[dist_utils.get_local_rank()],
             find_unused_parameters=find_unused,
         )
-        
+
     def _freeze_modules(self, frozen_modules: List[str] = []) -> None:
+        """Freeze specified modules (only used for non-LoRA training)"""
         for icecube in frozen_modules:
             for (name, module) in self.model.named_modules():
                 if name.startswith(icecube):
                     logger.info(f"Freezing Module: {name}")
                     for param in module.parameters():
                         param.requires_grad = False
+                    try:
+                        module.eval()
+                    except Exception:
+                        pass
 
     def _update_eval_stats(self, eval_loss: float) -> None:
         self.is_best_state = (
@@ -352,7 +437,7 @@ class UnitYFinetune:
             if loss.isnan():
                 logger.warning("Eval batch loss value is NaN, skipping")
                 continue
-            del batch  # force memory release
+            del batch
             loss_hist.update(1, loss.item())
             n_batches -= 1
         eval_loss = loss_hist.reduce()
@@ -370,38 +455,102 @@ class UnitYFinetune:
                 f"last lr={self.lr_scheduler.get_last_lr()[0]:.2E}"
             )
 
-    def _train_step(self, batch: List[dataloader.MultimodalSeqsBatch]) -> None:
-        """Run one train step"""
+    def _train_step(self, batch: dataloader.MultimodalSeqsBatch) -> None:
+        """Enhanced train step with loss debugging"""
         self.model.train()
-        self.optimizer.zero_grad()
+
+        accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
+
+        if (self.update_idx % accum_steps) == 0:
+            self.optimizer.zero_grad()
+
         with torch.autocast(device_type=self.params.device.type, dtype=self.params.float_dtype):
             tokens, units = self.model(batch)
-        
-        loss = self.calc_loss(batch, tokens, units)
-        if loss.isnan().any().item():
-            logger.error(batch.speech_to_text)
-            raise RuntimeError("Train loss is NaN! Something is wrong in the model!")
-        
-        self.grad_scaler.scale(loss).backward()
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
-        self.lr_scheduler.step()
-        
-        assert batch.speech_to_text.src_tokens is not None
-        self.train_loss_hist.update(1, loss.item())
+
+        # Compute loss with debugging on first few steps
+        raw_loss = self.calc_loss(batch, tokens, units)
+
+        # Debug loss calculation for first few steps
+        if self.update_idx < 5:
+            logger.info(f"Step {self.update_idx} loss debugging:")
+            logger.info(f"  Raw loss: {raw_loss.item():.6f}")
+            logger.info(f"  Tokens shape: {tokens.shape}")
+            logger.info(f"  Tokens mean: {tokens.mean().item():.3f}")
+            logger.info(f"  Tokens std: {tokens.std().item():.3f}")
+
+        # Check for problematic loss values
+        if raw_loss.isnan().any().item():
+            logger.error(f"Train loss is NaN! Raw loss: {raw_loss}")
+            raise RuntimeError("Train loss is NaN!")
+
+        if raw_loss.item() > 15.0:
+            logger.warning(f"Very high loss detected: {raw_loss.item():.4f}")
+
+        # Scale loss for gradient accumulation
+        scaled_loss = raw_loss / accum_steps
+        self.grad_scaler.scale(scaled_loss).backward()
+
+        # Gradient clipping for stability
+        if ((self.update_idx + 1) % accum_steps) == 0:
+            # Unscale gradients before clipping
+            self.grad_scaler.unscale_(self.optimizer)
+
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                max_norm=1.0
+            )
+
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            self.lr_scheduler.step()
+
+        self.train_loss_hist.update(1, raw_loss.item())
         self._train_step_log()
         self.update_idx += 1
+
+    def _save_lora_adapters(self) -> None:
+        """Save only LoRA adapter weights"""
+        lora_state_dict = {}
+        lora_config = {}
+
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                # Save LoRA parameters
+                lora_state_dict[f"{name}.lora_A"] = module.lora_A.cpu()
+                lora_state_dict[f"{name}.lora_B"] = module.lora_B.cpu()
+
+                # Save configuration (just once)
+                if not lora_config:
+                    lora_config = {
+                        "r": module.r,
+                        "lora_alpha": module.lora_alpha,
+                        "scaling": module.scaling
+                    }
+
+        lora_save_path = str(self.params.save_model_path).replace('.pt', '_lora_adapters.pt')
+        torch.save({
+            "model_name": self.params.model_name,
+            "lora_adapters": lora_state_dict,
+            "lora_config": lora_config
+        }, lora_save_path)
+        logger.info(f"LoRA adapters saved to {lora_save_path}")
 
     def _save_model(self) -> None:
         logger.info("Saving model")
         if dist_utils.is_main_process():
-            torch.save({
-                "model_name": self.params.model_name,
-                "model": {
-                    key.replace("module.model.model.", ""): value
-                    for key, value in self.model.state_dict().items()
-                }
-            }, self.params.save_model_path)
+            if self.has_lora:
+                # Save only LoRA adapters for manual LoRA
+                self._save_lora_adapters()
+            else:
+                # Full model saving for non-LoRA training
+                torch.save({
+                    "model_name": self.params.model_name,
+                    "model": {
+                        key.replace("module.model.model.", ""): value
+                        for key, value in self.model.state_dict().items()
+                    }
+                }, self.params.save_model_path)
         if dist_utils.is_dist_initialized():
             dist.barrier()
 
@@ -409,23 +558,19 @@ class UnitYFinetune:
         logger.info("Start Finetuning")
         self._reset_stats()
         self._eval_model(n_batches=100)
-        
+
         train_dataloader = self.train_data_loader.get_dataloader()
-        
+
         while self.epoch_idx < self.params.max_epochs and self.patience_left:
             for train_batch in tqdm(train_dataloader, desc="Training Steps"):
-                # Run batch through train step
                 self._train_step(train_batch)
-                
-                # Perform eval if its time to eval
+
                 if not self.update_idx or self.update_idx % self.params.eval_steps != 0:
                     continue
-                
-                # Clear GPU memory for eval
+
                 torch.cuda.empty_cache()
                 self._eval_model(n_batches=100)
-                    
-                # Save the current model if its the best we've ever had
+
                 if self.is_best_state:
                     self._save_model()
                 elif not self.patience_left:
@@ -435,5 +580,15 @@ class UnitYFinetune:
                         f"over last {no_improve_steps} updates"
                     )
                     break
-                
+
+            # Handle leftover gradients at end of epoch
+            accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
+            if (self.update_idx % accum_steps) != 0:
+                try:
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                    self.lr_scheduler.step()
+                finally:
+                    self.optimizer.zero_grad()
+
             self.epoch_idx += 1
