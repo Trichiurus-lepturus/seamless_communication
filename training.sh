@@ -80,19 +80,20 @@ run_single_stage() {
             --eval_dataset "$EVAL_DATASET" \
             --learning_rate 5e-5 \
             --warmup_steps 200 \
-            --batch_size 4 \
-            --grad_accum_steps 4 \
+            --batch_size 24 \
+            --grad_accum_steps 1 \
             --max_src_tokens 2000 \
             --eval_steps 200 \
             --max_epochs $epochs \
-            --patience 12 \
+            --patience 72 \
+            --log_steps 200 \
             --model_name seamlessM4T_medium \
             --save_model_to "$OUTPUT_DIR/checkpoint_${stage}.pt" \
             --lora_r 8 \
             --lora_alpha 16 \
             --lora_dropout 0.05 \
             --training_stage $stage \
-            --checkpoint_steps 100 \
+            --checkpoint_steps 200 \
         2>&1 | tee -a "$OUTPUT_DIR/train_${stage}_${log_suffix}.log"
 
     local exit_code=${PIPESTATUS[0]}
@@ -126,11 +127,12 @@ run_progressive_training() {
             --eval_dataset "$EVAL_DATASET" \
             --learning_rate 5e-5 \
             --warmup_steps 200 \
-            --batch_size 4 \
-            --grad_accum_steps 4 \
+            --batch_size 24 \
+            --grad_accum_steps 1 \
             --max_src_tokens 2000 \
             --eval_steps 200 \
-            --patience 12 \
+            --patience 72 \
+            --log_steps 200 \
             --model_name seamlessM4T_medium \
             --save_model_to "$OUTPUT_DIR/checkpoint_progressive.pt" \
             --lora_r 8 \
@@ -138,7 +140,7 @@ run_progressive_training() {
             --lora_dropout 0.05 \
             --progressive \
             --stage_epochs 3 3 4 \
-            --checkpoint_steps 100 \
+            --checkpoint_steps 200 \
         2>&1 | tee -a "$OUTPUT_DIR/train_progressive_full.log"
 
     local exit_code=${PIPESTATUS[0]}
@@ -198,19 +200,20 @@ except:
                 --eval_dataset "$EVAL_DATASET" \
                 --learning_rate 5e-5 \
                 --warmup_steps 200 \
-                --batch_size 4 \
-                --grad_accum_steps 4 \
+                --batch_size 24 \
+                --grad_accum_steps 1 \
                 --max_src_tokens 2000 \
                 --eval_steps 200 \
                 --max_epochs 10 \
-                --patience 12 \
+                --patience 72 \
+                --log_steps 200 \
                 --model_name seamlessM4T_medium \
                 --save_model_to "$OUTPUT_DIR/checkpoint_${stage}_resumed.pt" \
                 --lora_r 8 \
                 --lora_alpha 16 \
                 --lora_dropout 0.05 \
                 --training_stage $stage \
-                --checkpoint_steps 100 \
+                --checkpoint_steps 200 \
                 $resume_args \
             2>&1 | tee -a "$OUTPUT_DIR/train_${stage}_resumed.log"
     else

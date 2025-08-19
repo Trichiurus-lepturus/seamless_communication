@@ -435,9 +435,9 @@ def create_dataloader_with_augmentation(
 
             augmentation_config = {
                 "stage": stage_map.get(training_stage, "none"),
-                "augmentation_prob": 0.33,  # 33% as requested
+                "augmentation_prob": 0.20,
                 "audio_config": {
-                    "techniques_per_sample": (1, 3)
+                    "techniques_per_sample": (1, 1)
                 },
                 "text_config": {
                     "techniques_per_sample": (1, 2)

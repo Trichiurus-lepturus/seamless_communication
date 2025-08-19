@@ -62,13 +62,22 @@ class DiverseAudioAugmentation:
         self.preserve_length = preserve_length
 
         # CRITICAL FIX: Separate length-preserving and length-changing techniques
+        # self.length_preserving_techniques = [
+        #     'gaussian_noise', 'pink_noise', 'volume_change',
+        #     'lowpass_filter', 'highpass_filter', 'time_mask', 'reverb_simple'
+        # ]
+        #
+        # self.length_changing_techniques = [
+        #     'speed_change', 'pitch_shift', 'frequency_mask'
+        # ]
+
         self.length_preserving_techniques = [
-            'gaussian_noise', 'pink_noise', 'volume_change',
-            'lowpass_filter', 'highpass_filter', 'time_mask', 'reverb_simple'
+            'gaussian_noise', 'volume_change',
+            'lowpass_filter', 'highpass_filter', 'time_mask'
         ]
 
         self.length_changing_techniques = [
-            'speed_change', 'pitch_shift', 'frequency_mask'
+            'speed_change', 'pitch_shift'
         ]
 
         logger.info(f"Diverse audio augmentation: {augmentation_prob*100:.0f}% samples augmented, "
@@ -710,36 +719,9 @@ class AugmentedUnitYDataLoader(OriginalUnitYDataLoader):
     def _validate_loaded_audio(self, wav: torch.Tensor, sample_rate: int, audio_path: str) -> bool:
         """CRITICAL FIX: Comprehensive audio validation"""
 
-        # Check sample rate
-        if int(sample_rate) != self.SAMPLE_RATE:
-            logger.warning(f"Sample rate mismatch in {audio_path}: {sample_rate} != {self.SAMPLE_RATE}")
-            return False
-
-        # Check audio dimensions
-        if not (len(wav.shape) in (1, 2)):
-            logger.warning(f"Invalid audio dimensions in {audio_path}: {wav.shape}")
-            return False
-
-        # Check for empty audio
-        if wav.numel() == 0:
-            logger.warning(f"Empty audio file: {audio_path}")
-            return False
-
-        # CRITICAL FIX: Get number of samples correctly based on current format
-        # After standardization, wav should be [samples, channels] format
-        num_samples = wav.shape[0]  # First dimension is samples after standardization
-
-        # Check audio length
-        if wav.shape[0] < MIN_AUDIO_LENGTH_SAMPLES or wav.shape[0] > MAX_AUDIO_LENGTH_SAMPLES:
-            logger.warning(f"Audio length out of range in {audio_path}: {wav.shape[0]} samples")
-            return False
-
-        # Check for NaN or infinite values
-        if torch.isnan(wav).any() or torch.isinf(wav).any():
-            logger.warning(f"Audio contains NaN/inf values: {audio_path}")
-            return False
-
-        return True
+        return (wav.numel() > MIN_AUDIO_LENGTH_SAMPLES and
+            sample_rate == EXPECTED_SAMPLE_RATE and
+            not torch.isnan(wav).any())
 
     def _standardize_audio_shape(self, wav: torch.Tensor) -> torch.Tensor:
         """CRITICAL FIX: Robust audio shape standardization with validation"""

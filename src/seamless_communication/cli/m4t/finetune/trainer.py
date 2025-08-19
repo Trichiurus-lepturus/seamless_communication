@@ -117,41 +117,54 @@ class CheckpointManager:
         stage_prefix = f"{self.training_stage}_" if self.training_stage else ""
         return self.checkpoint_dir / f"{stage_prefix}checkpoint_step_{step}.pt"
 
-    def save_checkpoint(self, state_dict: Dict[str, Any], step: int) -> bool:
-        """Save checkpoint with atomic write and integrity check"""
+    def _get_lora_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Extract only LoRA adapter weights"""
+        lora_state = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                lora_state[f"{name}.lora_A"] = module.lora_A.cpu()
+                lora_state[f"{name}.lora_B"] = module.lora_B.cpu()
+        return lora_state
+
+    def save_checkpoint(self) -> bool:
+        """Save training checkpoint with LoRA-aware state"""
         try:
-            checkpoint_path = self.get_checkpoint_path(step)
-            temp_path = checkpoint_path.with_suffix('.tmp')
+            if self.has_lora:
+                # For LoRA training: Save only LoRA state + minimal training state
+                checkpoint_state = {
+                    'epoch': self.epoch_idx,
+                    'update_idx': self.update_idx,
+                    'best_eval_loss': self.best_eval_loss,
+                    'training_stage': self.params.training_stage,
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
+                    'lora_state_dict': self._get_lora_state_dict(),  # Only LoRA weights
+                    'completed': False
+                }
+            else:
+                # For full model training: Save complete state
+                checkpoint_state = {
+                    'epoch': self.epoch_idx,
+                    'update_idx': self.update_idx,
+                    'model_state_dict': self.model.state_dict(),  # Full model - only for non-LoRA
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
+                    'best_eval_loss': self.best_eval_loss,
+                    'training_stage': self.params.training_stage,
+                    'completed': False
+                }
 
-            # Add metadata
-            state_dict.update({
-                'checkpoint_step': step,
-                'checkpoint_time': time.time(),
-                'training_stage': self.training_stage,
-                'checkpoint_version': '1.0'
-            })
+            # Add RNG states
+            checkpoint_state['random_state'] = random.getstate()
+            checkpoint_state['numpy_random_state'] = np.random.get_state()
+            checkpoint_state['torch_random_state'] = torch.get_rng_state()
+            if torch.cuda.is_available():
+                checkpoint_state['cuda_random_state'] = torch.cuda.get_rng_state()
 
-            # Atomic save
-            torch.save(state_dict, temp_path)
-            temp_path.rename(checkpoint_path)
-
-            # Update latest checkpoint pointer
-            latest_info = {
-                'latest_checkpoint': str(checkpoint_path),
-                'step': step,
-                'training_stage': self.training_stage,
-                'timestamp': time.time()
-            }
-
-            with open(self.latest_checkpoint_path, 'w') as f:
-                json.dump(latest_info, f, indent=2)
-
-            logger.info(f"Checkpoint saved: {checkpoint_path}")
-
-            # Cleanup old checkpoints (keep last 3)
-            self._cleanup_old_checkpoints()
-
-            return True
+            success = self.checkpoint_manager.save_checkpoint(checkpoint_state, self.update_idx)
+            if success:
+                self.last_checkpoint_step = self.update_idx
+            return success
 
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
@@ -972,7 +985,10 @@ class UnitYFinetune:
         # Create stage-specific save path
         save_path = self.params.save_model_path
         if self.params.training_stage:
-            save_path = str(save_path).replace('.pt', f'_{self.params.training_stage}_lora.pt')
+            # Check if stage suffix already exists to avoid duplication
+            stage_suffix = f'_{self.params.training_stage}_lora.pt'
+            if not str(save_path).endswith(stage_suffix):
+                save_path = str(save_path).replace('.pt', stage_suffix)
         else:
             save_path = str(save_path).replace('.pt', '_lora_adapters.pt')
 
