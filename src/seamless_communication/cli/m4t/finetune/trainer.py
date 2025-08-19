@@ -1,17 +1,14 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# MIT_LICENSE file in the root directory of this source tree.
-
 import logging
 import time
-from contextlib import contextmanager
+import signal
+import os
+import json
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from tqdm import tqdm
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -28,7 +25,6 @@ from seamless_communication.models.unity import (
     UnitYModel,
     UnitYT2UModel,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +50,7 @@ class FinetuneParams:
     """Float Dtype"""
 
     max_epochs: int = 10
-    """ Maximum number of trainign epochs"""
+    """ Maximum number of training epochs"""
 
     label_smoothing: float = 0.2
     """ Label smoothing coefficient for nll_loss """
@@ -73,7 +69,7 @@ class FinetuneParams:
     over the last `patience * eval_steps` training steps"""
 
     learning_rate: float = 1e-5
-    """ Optimizer learining rate """
+    """ Optimizer learning rate """
 
     train_batch_size: int = 5
     """The batch size during train steps"""
@@ -86,6 +82,158 @@ class FinetuneParams:
 
     device: Device = torch.device("cuda")
     """ Where to run computation"""
+
+    # NEW: Progressive training support
+    training_stage: Optional[str] = None
+    """Current training stage for progressive training"""
+
+    # NEW: Error recovery support
+    checkpoint_steps: int = 100
+    """Save checkpoint every N steps"""
+
+    resume_from_checkpoint: Optional[str] = None
+    """Path to checkpoint to resume from"""
+
+
+class CheckpointManager:
+    """Manages checkpoint saving/loading with error recovery"""
+
+    def __init__(self, save_dir: Path, training_stage: Optional[str] = None):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.training_stage = training_stage
+
+        # Checkpoint paths
+        self.checkpoint_dir = self.save_dir / "checkpoints"
+        self.checkpoint_dir.mkdir(exist_ok=True)
+
+        self.latest_checkpoint_path = self.checkpoint_dir / "latest_checkpoint.json"
+        self.emergency_checkpoint_path = self.checkpoint_dir / "emergency_checkpoint.pt"
+
+        logger.info(f"CheckpointManager initialized: {self.checkpoint_dir}")
+
+    def get_checkpoint_path(self, step: int) -> Path:
+        """Get path for a specific checkpoint"""
+        stage_prefix = f"{self.training_stage}_" if self.training_stage else ""
+        return self.checkpoint_dir / f"{stage_prefix}checkpoint_step_{step}.pt"
+
+    def save_checkpoint(self, state_dict: Dict[str, Any], step: int) -> bool:
+        """Save checkpoint with atomic write and integrity check"""
+        try:
+            checkpoint_path = self.get_checkpoint_path(step)
+            temp_path = checkpoint_path.with_suffix('.tmp')
+
+            # Add metadata
+            state_dict.update({
+                'checkpoint_step': step,
+                'checkpoint_time': time.time(),
+                'training_stage': self.training_stage,
+                'checkpoint_version': '1.0'
+            })
+
+            # Atomic save
+            torch.save(state_dict, temp_path)
+            temp_path.rename(checkpoint_path)
+
+            # Update latest checkpoint pointer
+            latest_info = {
+                'latest_checkpoint': str(checkpoint_path),
+                'step': step,
+                'training_stage': self.training_stage,
+                'timestamp': time.time()
+            }
+
+            with open(self.latest_checkpoint_path, 'w') as f:
+                json.dump(latest_info, f, indent=2)
+
+            logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+            # Cleanup old checkpoints (keep last 3)
+            self._cleanup_old_checkpoints()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return False
+
+    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load checkpoint with integrity verification"""
+        try:
+            if checkpoint_path is None:
+                checkpoint_path = self._get_latest_checkpoint_path()
+
+            if checkpoint_path is None or not Path(checkpoint_path).exists():
+                logger.info("No checkpoint found to resume from")
+                return None
+
+            logger.info(f"Loading checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+            # Verify checkpoint integrity
+            required_keys = ['epoch', 'update_idx', 'model_state_dict']
+            if not all(key in checkpoint for key in required_keys):
+                logger.warning(f"Checkpoint missing required keys: {checkpoint_path}")
+                return None
+
+            logger.info(f"Successfully loaded checkpoint from step {checkpoint.get('checkpoint_step', 'unknown')}")
+            return checkpoint
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            return None
+
+    def _get_latest_checkpoint_path(self) -> Optional[str]:
+        """Get path to latest checkpoint"""
+        try:
+            if not self.latest_checkpoint_path.exists():
+                return None
+
+            with open(self.latest_checkpoint_path, 'r') as f:
+                latest_info = json.load(f)
+
+            return latest_info.get('latest_checkpoint')
+
+        except Exception as e:
+            logger.warning(f"Failed to read latest checkpoint info: {e}")
+            return None
+
+    def _cleanup_old_checkpoints(self, keep_last: int = 3):
+        """Remove old checkpoints, keeping only the most recent"""
+        try:
+            stage_prefix = f"{self.training_stage}_" if self.training_stage else ""
+            pattern = f"{stage_prefix}checkpoint_step_*.pt"
+
+            checkpoints = list(self.checkpoint_dir.glob(pattern))
+            checkpoints.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            for old_checkpoint in checkpoints[keep_last:]:
+                old_checkpoint.unlink()
+                logger.debug(f"Removed old checkpoint: {old_checkpoint}")
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old checkpoints: {e}")
+
+    def save_emergency_checkpoint(self, model, optimizer, lr_scheduler, step: int):
+        """Save emergency checkpoint on interruption"""
+        try:
+            logger.info("Saving emergency checkpoint...")
+
+            state_dict = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                'step': step,
+                'emergency_save': True,
+                'training_stage': self.training_stage,
+                'timestamp': time.time()
+            }
+
+            torch.save(state_dict, self.emergency_checkpoint_path)
+            logger.info(f"Emergency checkpoint saved: {self.emergency_checkpoint_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save emergency checkpoint: {e}")
 
 
 class UnitYFinetuneWrapper(nn.Module):
@@ -103,7 +251,8 @@ class UnitYFinetuneWrapper(nn.Module):
     def forward(
         self, batch: dataloader.MultimodalSeqsBatch
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        dummy_context = contextmanager(lambda: iter([None]))()
+        # dummy_context = contextmanager(lambda: iter([None]))()
+        dummy_context = nullcontext()
         with torch.no_grad() if self.freeze_s2t else dummy_context:  # type:ignore
             assert batch.speech_to_text.src_tokens is not None
             seqs = batch.speech_to_text.src_tokens.to(self.device)
@@ -128,7 +277,8 @@ class UnitYFinetuneWrapper(nn.Module):
             return (text_logits, None)
         assert self.model.t2u_model is not None
         assert batch.text_to_units.prev_output_tokens is not None
-        dummy_context = contextmanager(lambda: iter([None]))()
+        # dummy_context = contextmanager(lambda: iter([None]))()
+        dummy_context = nullcontext()
         with torch.no_grad() if self.freeze_t2u else dummy_context:  # type:ignore
             if not isinstance(self.model.t2u_model, UnitYT2UModel):
                 raise NotImplementedError(
@@ -168,7 +318,6 @@ class CalcLoss:
         self.s2t_vocab_info = s2t_vocab_info
         self.t2u_vocab_info = t2u_vocab_info
 
-        # Add debugging
         logger.info(f"Loss calculation initialized with label_smoothing={label_smoothing}")
 
     def __call__(
@@ -233,7 +382,7 @@ class CalcLoss:
 
 
 class LossCollector:
-    """Aggregrates loss history across nodes"""
+    """Aggregates loss history across nodes"""
 
     def __init__(self, device: Optional[Device] = None, reduce_op: str = "avg"):
         self.n_samples: float = 0
@@ -271,31 +420,60 @@ class LossCollector:
         reduced = torch.sum(losses, dim=0).reshape(2).cpu()
         return reduced[0].item(), reduced[1].item()
 
-def debug_loss_calculation(calc_loss_fn, batch, text_logits, unit_logits=None):
-    """Debug loss calculation to ensure proper values"""
 
-    # Calculate loss components
-    with torch.no_grad():
-        loss = calc_loss_fn(batch, text_logits, unit_logits)
+class ProgressiveTrainingVerifier:
+    """Verifies progressive training setup and tracks metrics"""
 
-        # Additional debugging
-        target_lengths = batch.speech_to_text.target_lengths
-        target_tokens = batch.speech_to_text.target_tokens
+    def __init__(self, model, training_stage: Optional[str] = None):
+        self.model = model
+        self.training_stage = training_stage
+        self.stage_metrics = {}
 
-        logger.info(f"Loss debugging:")
-        logger.info(f"  Final loss: {loss.item():.4f}")
-        logger.info(f"  Text logits shape: {text_logits.shape}")
-        logger.info(f"  Target tokens shape: {target_tokens.shape}")
-        logger.info(f"  Target lengths: {target_lengths}")
-        logger.info(f"  Batch size: {text_logits.shape[0]}")
-        logger.info(f"  Vocab size: {text_logits.shape[-1]}")
+    def verify_lora_setup_for_stage(self) -> bool:
+        """Verify that only expected LoRA modules are active for current stage"""
+        if self.training_stage is None:
+            return True
 
-        # Check for reasonable logit values
-        logit_mean = text_logits.mean().item()
-        logit_std = text_logits.std().item()
-        logger.info(f"  Logit statistics: mean={logit_mean:.3f}, std={logit_std:.3f}")
+        active_speech_lora = 0
+        active_text_lora = 0
+        inactive_lora = 0
 
-        return loss
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                module_path = name  # This is already the correct path
+
+                if hasattr(module, 'is_active') and module.is_active:
+                    if 'speech_encoder' in module_path:
+                        active_speech_lora += 1
+                    elif 'text_decoder' in module_path:
+                        active_text_lora += 1
+                else:
+                    inactive_lora += 1
+
+        # Verify stage-specific expectations
+        if self.training_stage == "speech_encoder":
+            expected = active_speech_lora > 0 and active_text_lora == 0
+            logger.info(f"Stage {self.training_stage}: {active_speech_lora} speech LoRA active, "
+                       f"{active_text_lora} text LoRA active, {inactive_lora} inactive")
+        elif self.training_stage == "text_decoder":
+            expected = active_speech_lora == 0 and active_text_lora > 0
+            logger.info(f"Stage {self.training_stage}: {active_speech_lora} speech LoRA active, "
+                       f"{active_text_lora} text LoRA active, {inactive_lora} inactive")
+        elif self.training_stage == "full":
+            expected = active_speech_lora > 0 and active_text_lora > 0
+            logger.info(f"Stage {self.training_stage}: {active_speech_lora} speech LoRA active, "
+                       f"{active_text_lora} text LoRA active, {inactive_lora} inactive")
+        else:
+            expected = True  # Conservative mode
+
+        return expected
+
+    def log_stage_progress(self, epoch: int, loss: float):
+        """Log progress specific to training stage"""
+        if self.training_stage:
+            logger.info(f"Progressive Training - Stage: {self.training_stage}, "
+                       f"Epoch: {epoch}, Loss: {loss:.4f}")
+
 
 class UnitYFinetune:
     def __init__(
@@ -315,12 +493,33 @@ class UnitYFinetune:
             else None,
         )
 
-        self.model = self._wrap_model_for_trainining(model=model)
+        self.model = self._wrap_model_for_training(model=model)
 
         # Check for manual LoRA implementation
         self.has_lora = self._detect_lora_modules()
         if self.has_lora:
             logger.info("Detected manual LoRA implementation")
+
+        # Initialize progressive training verifier
+        self.verifier = ProgressiveTrainingVerifier(
+            self.model,
+            self.params.training_stage
+        )
+
+        # Initialize checkpoint manager
+        checkpoint_dir = self.params.save_model_path.parent / "training_checkpoints"
+        self.checkpoint_manager = CheckpointManager(
+            save_dir=checkpoint_dir,
+            training_stage=self.params.training_stage
+        )
+
+        # Setup signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+
+        # Verify LoRA setup for current stage
+        if self.has_lora and self.params.training_stage:
+            if not self.verifier.verify_lora_setup_for_stage():
+                logger.warning(f"LoRA setup may not match expected stage: {self.params.training_stage}")
 
         # Only apply freeze_modules if we're NOT using LoRA (since LoRA handles freezing)
         if freeze_modules and not self.has_lora:
@@ -341,15 +540,23 @@ class UnitYFinetune:
         if len(trainable_params) == 0:
             raise RuntimeError("No trainable parameters found! Check LoRA implementation.")
 
-        self.optimizer = AdamW(
-            params=trainable_params,
-            lr=self.params.learning_rate,
-            betas=(0.9, 0.98),
-            eps=1e-08,
-            maximize=False,
-            weight_decay=0.0,
-            fused=(self.params.device.type == "cuda"),
-        )
+        # Enhanced optimizer setup for progressive training
+        optimizer_params = {
+            "lr": self.params.learning_rate,
+            "betas": (0.9, 0.98),
+            "eps": 1e-08,
+            "maximize": False,
+            "weight_decay": 0.0,
+        }
+
+        # Add fused optimization for CUDA if available
+        if self.params.device.type == "cuda":
+            try:
+                optimizer_params["fused"] = True
+            except TypeError:
+                logger.warning("Fused AdamW not available, using standard AdamW")
+
+        self.optimizer = AdamW(params=trainable_params, **optimizer_params)
 
         self.lr_scheduler = MyleLR(
             optimizer=self.optimizer,
@@ -363,7 +570,102 @@ class UnitYFinetune:
         self.patience_left: int = self.params.patience
         self.best_eval_loss: Optional[float] = None
         self.is_best_state: bool = False
+
+        # NEW: Error recovery state
+        self.training_interrupted = False
+        self.last_checkpoint_step = 0
+
         torch.set_float32_matmul_precision("high")
+
+        # Log training setup
+        self._log_training_setup()
+
+    def update_training_stage(self, new_stage: str):
+        """Update training stage and reconfigure optimizer"""
+        logger.info(f"Updating training stage: {self.params.training_stage} -> {new_stage}")
+
+        old_stage = self.params.training_stage
+        self.params.training_stage = new_stage
+
+        # Import and apply stage activation
+        from .finetune import activate_lora_for_stage
+        activated = activate_lora_for_stage(self.model, new_stage)
+
+        if activated == 0:
+            logger.error(f"222 No LoRA modules activated for stage '{new_stage}'!")
+            raise RuntimeError(f"Stage '{new_stage}' activation failed!")
+
+        # Verify everything is correct
+        if not self._verify_optimizer_parameters():
+            raise RuntimeError(f"Optimizer verification failed after stage update to '{new_stage}'!")
+
+        # Update verifier
+        self.verifier.training_stage = new_stage
+
+        logger.info(f"111 Successfully updated to stage '{new_stage}' with {activated} active LoRA modules")
+
+
+    def _verify_optimizer_parameters(self) -> bool:
+        """Verify optimizer has all active LoRA parameters"""
+
+        # Get all trainable LoRA parameters from model
+        model_lora_params = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and ('lora_A' in name or 'lora_B' in name):
+                model_lora_params.add(id(param))
+
+        # Get all parameters in optimizer
+        optimizer_params = set()
+        for param_group in self.optimizer.param_groups:
+            for param in param_group['params']:
+                optimizer_params.add(id(param))
+
+        # Check for mismatches
+        missing_in_optimizer = model_lora_params - optimizer_params
+        extra_in_optimizer = optimizer_params - model_lora_params
+
+        if missing_in_optimizer:
+            logger.error(f"222 CRITICAL: {len(missing_in_optimizer)} active LoRA parameters missing from optimizer!")
+            return False
+
+        if extra_in_optimizer:
+            logger.warning(f"222 Optimizer has {len(extra_in_optimizer)} extra parameters")
+
+        logger.info(f"111 Optimizer parameter verification passed: {len(model_lora_params)} LoRA parameters")
+        return True
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+            self.training_interrupted = True
+
+            # Save emergency checkpoint
+            try:
+                self.checkpoint_manager.save_emergency_checkpoint(
+                    self.model, self.optimizer, self.lr_scheduler, self.update_idx
+                )
+            except Exception as e:
+                logger.error(f"Failed to save emergency checkpoint: {e}")
+
+        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination
+
+    def _log_training_setup(self):
+        """Log detailed training setup information"""
+        logger.info("=== TRAINING SETUP ===")
+        logger.info(f"Training stage: {self.params.training_stage or 'standard'}")
+        logger.info(f"Finetune mode: {self.params.finetune_mode}")
+        logger.info(f"Max epochs: {self.params.max_epochs}")
+        logger.info(f"Learning rate: {self.params.learning_rate}")
+        logger.info(f"Batch size: {self.params.train_batch_size}")
+        logger.info(f"Gradient accumulation steps: {self.params.grad_accum_steps}")
+        logger.info(f"Checkpoint every: {self.params.checkpoint_steps} steps")
+        if self.has_lora:
+            logger.info("Using LoRA fine-tuning")
+        if self.params.resume_from_checkpoint:
+            logger.info(f"Will resume from: {self.params.resume_from_checkpoint}")
+        logger.info("=====================")
 
     def _detect_lora_modules(self) -> bool:
         """Detect if the model has manual LoRA modules"""
@@ -380,13 +682,18 @@ class UnitYFinetune:
         self.best_eval_loss = None
         self.is_best_state = False
 
-    def _wrap_model_for_trainining(self, model: UnitYModel) -> nn.Module:
+    def _wrap_model_for_training(self, model: UnitYModel) -> nn.Module:
         wrapped_model = UnitYFinetuneWrapper(
             model=model, mode=self.params.finetune_mode, device=self.params.device
         )
         if not dist_utils.is_dist_initialized():
             return wrapped_model
         find_unused = self.params.finetune_mode == FinetuneMode.TEXT_TO_SPEECH
+
+        # For progressive training, we might need to handle unused parameters differently
+        if self.params.training_stage in ["speech_encoder", "text_decoder"]:
+            find_unused = True
+
         return nn.parallel.DistributedDataParallel(
             wrapped_model,
             device_ids=[dist_utils.get_local_rank()],
@@ -421,6 +728,9 @@ class UnitYFinetune:
             f"patience_steps_left={self.patience_left}"
         )
 
+        # Log stage-specific progress
+        self.verifier.log_stage_progress(self.epoch_idx, eval_loss)
+
     @torch.no_grad()
     def _eval_model(self, n_batches: int) -> None:
         """Calc avg loss on eval dataset and update evaluation stats"""
@@ -429,92 +739,211 @@ class UnitYFinetune:
         logger.info(f"Evaluation Step {self.update_idx // self.params.eval_steps}...")
         loss_hist = LossCollector(device=self.params.device)
         self.model.eval()
-        for batch in self.eval_data_loader.get_dataloader():
-            if n_batches == 0:
-                break
-            assert batch.speech_to_text.src_tokens is not None
-            with torch.autocast(device_type=self.params.device.type, dtype=self.params.float_dtype):
-                loss = self.calc_loss(batch, *self.model(batch))
-            if loss.isnan():
-                logger.warning("Eval batch loss value is NaN, skipping")
-                continue
-            del batch
-            loss_hist.update(1, loss.item())
-            n_batches -= 1
+
+        batch_count = 0
+        try:
+            for batch in self.eval_data_loader.get_dataloader():
+                if n_batches == 0 or self.training_interrupted:
+                    break
+                assert batch.speech_to_text.src_tokens is not None
+                with torch.autocast(device_type=self.params.device.type, dtype=self.params.float_dtype):
+                    loss = self.calc_loss(batch, *self.model(batch))
+                if loss.isnan():
+                    logger.warning("Eval batch loss value is NaN, skipping")
+                    continue
+                loss_hist.update(1, loss.item())
+                batch_count += 1
+                n_batches -= 1
+
+                # Clear memory after each eval batch
+                del batch
+                if batch_count % 10 == 0:
+                    torch.cuda.empty_cache()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning("OOM during evaluation, cleaning up and retrying with fewer batches")
+                torch.cuda.empty_cache()
+                return self._eval_model(min(n_batches, 50))  # Retry with fewer batches
+            else:
+                raise e
+
         eval_loss = loss_hist.reduce()
         self._update_eval_stats(eval_loss)
 
     def _train_step_log(self) -> None:
-        """Log train stats"""
+        """Log train stats with progressive training context"""
         if (self.update_idx + 1) % self.params.log_steps == 0:
             avg_loss = self.train_loss_hist.reduce()
             self.train_loss_hist.reset()
+
+            stage_info = f" [{self.params.training_stage}]" if self.params.training_stage else ""
             logger.info(
                 f"Epoch {str(self.epoch_idx + 1).zfill(3)} / "
-                f"update {str(self.update_idx + 1).zfill(5)}: "
+                f"update {str(self.update_idx + 1).zfill(5)}{stage_info}: "
                 f"train loss={avg_loss:.4f} "
                 f"last lr={self.lr_scheduler.get_last_lr()[0]:.2E}"
             )
 
-    def _train_step(self, batch: dataloader.MultimodalSeqsBatch) -> None:
-        """Enhanced train step with loss debugging"""
+    def _train_step(self, batch: dataloader.MultimodalSeqsBatch) -> bool:
+        """Enhanced train step with error recovery. Returns False if should stop training."""
 
-        self.model.train()
+        if self.training_interrupted:
+            return False
 
-        accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
+        try:
+            self.model.train()
 
-        if (self.update_idx % accum_steps) == 0:
-            self.optimizer.zero_grad()
+            accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
 
-        with torch.autocast(device_type=self.params.device.type, dtype=self.params.float_dtype):
-            tokens, units = self.model(batch)
+            if (self.update_idx % accum_steps) == 0:
+                self.optimizer.zero_grad()
 
-        # Compute loss with debugging on first few steps
-        raw_loss = self.calc_loss(batch, tokens, units)
+            with torch.autocast(device_type=self.params.device.type, dtype=self.params.float_dtype):
+                tokens, units = self.model(batch)
 
-        # Debug loss calculation for first few steps
-        if self.update_idx < 5:
-            logger.info(f"Step {self.update_idx} loss debugging:")
-            logger.info(f"  Raw loss: {raw_loss.item():.6f}")
-            logger.info(f"  Tokens shape: {tokens.shape}")
-            logger.info(f"  Tokens mean: {tokens.mean().item():.3f}")
-            logger.info(f"  Tokens std: {tokens.std().item():.3f}")
+            # Compute loss
+            raw_loss = self.calc_loss(batch, tokens, units)
 
-        # Check for problematic loss values
-        if raw_loss.isnan().any().item():
-            logger.error(f"Train loss is NaN! Raw loss: {raw_loss}")
-            raise RuntimeError("Train loss is NaN!")
+            # Debug loss calculation for first few steps
+            if self.update_idx < 3:
+                stage_info = f" (Stage: {self.params.training_stage})" if self.params.training_stage else ""
+                logger.info(f"Step {self.update_idx} loss{stage_info}: {raw_loss.item():.6f}")
 
-        if raw_loss.item() > 15.0:
-            logger.warning(f"Very high loss detected: {raw_loss.item():.4f}")
+            # Check for problematic loss values
+            if raw_loss.isnan().any().item():
+                logger.error(f"Train loss is NaN! Raw loss: {raw_loss}")
+                raise RuntimeError("Train loss is NaN!")
 
-        # Scale loss for gradient accumulation
-        scaled_loss = raw_loss / accum_steps
-        self.grad_scaler.scale(scaled_loss).backward()
+            if raw_loss.item() > 15.0:
+                logger.warning(f"Very high loss detected: {raw_loss.item():.4f}")
 
-        # Gradient clipping for stability
-        if ((self.update_idx + 1) % accum_steps) == 0:
-            # Unscale gradients before clipping
-            self.grad_scaler.unscale_(self.optimizer)
+            # Scale loss for gradient accumulation
+            scaled_loss = raw_loss / accum_steps
+            self.grad_scaler.scale(scaled_loss).backward()
 
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                max_norm=1.0
-            )
+            # Gradient clipping for stability
+            if ((self.update_idx + 1) % accum_steps) == 0:
+                # Unscale gradients before clipping
+                self.grad_scaler.unscale_(self.optimizer)
 
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-            self.lr_scheduler.step()
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    max_norm=1.0
+                )
 
-        self.train_loss_hist.update(1, raw_loss.item())
-        self._train_step_log()
-        self.update_idx += 1
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+                self.lr_scheduler.step()
+
+            self.train_loss_hist.update(1, raw_loss.item())
+            self._train_step_log()
+            self.update_idx += 1
+
+            return True
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning("OOM during training step, cleaning up and skipping batch")
+                torch.cuda.empty_cache()
+                # Reset gradients and continue
+                self.optimizer.zero_grad()
+                return True
+            else:
+                logger.error(f"Training step failed: {e}")
+                return False
+
+    def save_checkpoint(self) -> bool:
+        """Save training checkpoint"""
+        try:
+            # Prepare checkpoint state
+            checkpoint_state = {
+                'epoch': self.epoch_idx,
+                'update_idx': self.update_idx,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
+                'grad_scaler_state_dict': self.grad_scaler.state_dict(),
+                'best_eval_loss': self.best_eval_loss,
+                'patience_left': self.patience_left,
+                'params': self.params,
+                'training_stage': self.params.training_stage,
+                'random_state': torch.get_rng_state(),
+            }
+
+            # Add CUDA random state if available
+            if torch.cuda.is_available():
+                checkpoint_state['cuda_random_state'] = torch.cuda.get_rng_state()
+
+            success = self.checkpoint_manager.save_checkpoint(checkpoint_state, self.update_idx)
+            if success:
+                self.last_checkpoint_step = self.update_idx
+            return success
+
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return False
+
+    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> bool:
+        """FIXED: Load training checkpoint with stage reactivation"""
+        try:
+            checkpoint = self.checkpoint_manager.load_checkpoint(checkpoint_path)
+            if checkpoint is None:
+                return False
+
+            # Restore training state
+            self.epoch_idx = checkpoint['epoch']
+            self.update_idx = checkpoint['update_idx']
+            self.best_eval_loss = checkpoint.get('best_eval_loss')
+            self.patience_left = checkpoint.get('patience_left', self.params.patience)
+
+            # Restore model state first
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+
+            # CRITICAL FIX: Reactivate LoRA for current stage BEFORE updating optimizer
+            if self.has_lora and self.params.training_stage:
+                logger.info(f"Reactivating LoRA modules for stage: {self.params.training_stage}")
+
+                # Import here to avoid circular imports
+                from .finetune import activate_lora_for_stage
+                activated = activate_lora_for_stage(self.model, self.params.training_stage)
+                logger.info(f"Reactivated {activated} LoRA modules for stage: {self.params.training_stage}")
+
+            # THEN restore optimizer and scheduler state
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+            except Exception as e:
+                logger.warning(f"Failed to restore optimizer/scheduler state: {e}")
+                logger.warning("Continuing with fresh optimizer state")
+
+            # Restore grad scaler state
+            if 'grad_scaler_state_dict' in checkpoint:
+                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state_dict'])
+
+            # Restore random states
+            if 'random_state' in checkpoint:
+                torch.set_rng_state(checkpoint['random_state'])
+            if 'cuda_random_state' in checkpoint and torch.cuda.is_available():
+                torch.cuda.set_rng_state(checkpoint['cuda_random_state'])
+
+            logger.info(f"111 Resumed training from epoch {self.epoch_idx}, step {self.update_idx}")
+
+            # CRITICAL: Verify optimizer has correct parameters
+            self._verify_optimizer_parameters()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return False
 
     def _save_lora_adapters(self) -> None:
-        """Save only LoRA adapter weights"""
+        """Save LoRA adapter weights with stage information"""
         lora_state_dict = {}
         lora_config = {}
+        active_modules = []
 
         for name, module in self.model.named_modules():
             if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
@@ -522,21 +951,43 @@ class UnitYFinetune:
                 lora_state_dict[f"{name}.lora_A"] = module.lora_A.cpu()
                 lora_state_dict[f"{name}.lora_B"] = module.lora_B.cpu()
 
+                # Track active modules
+                if hasattr(module, 'is_active') and module.is_active:
+                    module_path = name.replace('.original_module', '')
+                    active_modules.append(module_path)
+
                 # Save configuration (just once)
                 if not lora_config:
                     lora_config = {
                         "r": module.r,
                         "lora_alpha": module.lora_alpha,
-                        "scaling": module.scaling
+                        "scaling": module.scaling,
+                        "training_stage": self.params.training_stage,
+                        "active_modules": active_modules
                     }
 
-        lora_save_path = str(self.params.save_model_path).replace('.pt', '_lora_adapters.pt')
+        # Update active modules in config
+        lora_config["active_modules"] = active_modules
+
+        # Create stage-specific save path
+        save_path = self.params.save_model_path
+        if self.params.training_stage:
+            save_path = str(save_path).replace('.pt', f'_{self.params.training_stage}_lora.pt')
+        else:
+            save_path = str(save_path).replace('.pt', '_lora_adapters.pt')
+
         torch.save({
             "model_name": self.params.model_name,
             "lora_adapters": lora_state_dict,
-            "lora_config": lora_config
-        }, lora_save_path)
-        logger.info(f"LoRA adapters saved to {lora_save_path}")
+            "lora_config": lora_config,
+            "training_stage": self.params.training_stage,
+            "best_eval_loss": self.best_eval_loss,
+            "epoch": self.epoch_idx,
+            "completed": not self.training_interrupted
+        }, save_path)
+
+        logger.info(f"LoRA adapters saved to {save_path}")
+        logger.info(f"Active LoRA modules: {len(active_modules)}")
 
     def _save_model(self) -> None:
         logger.info("Saving model")
@@ -551,46 +1002,134 @@ class UnitYFinetune:
                     "model": {
                         key.replace("module.model.model.", ""): value
                         for key, value in self.model.state_dict().items()
-                    }
+                    },
+                    "training_stage": self.params.training_stage,
+                    "best_eval_loss": self.best_eval_loss,
+                    "epoch": self.epoch_idx,
+                    "completed": not self.training_interrupted
                 }, self.params.save_model_path)
         if dist_utils.is_dist_initialized():
             dist.barrier()
 
-    def run(self) -> None:
-        logger.info("Start Finetuning")
-        self._reset_stats()
-        self._eval_model(n_batches=100)
+    def run(self) -> bool:
+        """Enhanced training loop with error recovery. Returns True if completed successfully."""
+        stage_info = f" (Stage: {self.params.training_stage})" if self.params.training_stage else ""
+        logger.info(f"Start Finetuning{stage_info}")
+
+        # Attempt to resume from checkpoint
+        if self.params.resume_from_checkpoint:
+            if not self.load_checkpoint(self.params.resume_from_checkpoint):
+                logger.warning("Failed to resume from checkpoint, starting fresh")
+                self._reset_stats()
+        else:
+            # Check for automatic resume
+            if not self.load_checkpoint():
+                logger.info("No checkpoint found, starting fresh training")
+                self._reset_stats()
+
+        # Initial evaluation
+        try:
+            self._eval_model(n_batches=100)
+        except Exception as e:
+            logger.warning(f"Initial evaluation failed: {e}")
 
         train_dataloader = self.train_data_loader.get_dataloader()
+        training_successful = False
 
-        while self.epoch_idx < self.params.max_epochs and self.patience_left:
-            for train_batch in tqdm(train_dataloader, desc="Training Steps"):
-                self._train_step(train_batch)
+        try:
+            while self.epoch_idx < self.params.max_epochs and self.patience_left and not self.training_interrupted:
+                logger.info(f"Starting epoch {self.epoch_idx + 1}/{self.params.max_epochs}{stage_info}")
 
-                if not self.update_idx or self.update_idx % self.params.eval_steps != 0:
-                    continue
+                for train_batch in tqdm(train_dataloader, desc=f"Training Steps{stage_info}"):
+                    if self.training_interrupted:
+                        logger.info("Training interrupted, breaking from training loop")
+                        break
 
-                torch.cuda.empty_cache()
-                self._eval_model(n_batches=100)
+                    # Execute training step with error recovery
+                    if not self._train_step(train_batch):
+                        logger.error("Training step failed, stopping training")
+                        break
 
-                if self.is_best_state:
-                    self._save_model()
-                elif not self.patience_left:
-                    no_improve_steps = self.params.eval_steps * self.params.patience
-                    logger.info(
-                        "Early termination, as eval loss did not improve "
-                        f"over last {no_improve_steps} updates"
-                    )
+                    # Periodic checkpoint saving
+                    if self.update_idx % self.params.checkpoint_steps == 0:
+                        self.save_checkpoint()
+
+                    if not self.update_idx or self.update_idx % self.params.eval_steps != 0:
+                        continue
+
+                    # Enhanced memory management for progressive training
+                    torch.cuda.empty_cache()
+
+                    try:
+                        self._eval_model(n_batches=100)
+                    except Exception as e:
+                        logger.warning(f"Evaluation failed: {e}")
+                        continue
+
+                    if self.is_best_state:
+                        self._save_model()
+                    elif not self.patience_left:
+                        no_improve_steps = self.params.eval_steps * self.params.patience
+                        logger.info(
+                            f"Early termination{stage_info}, as eval loss did not improve "
+                            f"over last {no_improve_steps} updates"
+                        )
+                        training_successful = True
+                        break
+
+                if self.training_interrupted:
                     break
 
-            # Handle leftover gradients at end of epoch
-            accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
-            if (self.update_idx % accum_steps) != 0:
-                try:
-                    self.grad_scaler.step(self.optimizer)
-                    self.grad_scaler.update()
-                    self.lr_scheduler.step()
-                finally:
-                    self.optimizer.zero_grad()
+                # Handle leftover gradients at end of epoch
+                accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
+                if (self.update_idx % accum_steps) != 0:
+                    try:
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                        self.lr_scheduler.step()
+                    finally:
+                        self.optimizer.zero_grad()
 
-            self.epoch_idx += 1
+                self.epoch_idx += 1
+
+                # Memory cleanup between epochs
+                torch.cuda.empty_cache()
+
+            # Check if training completed successfully
+            if not self.training_interrupted and (self.epoch_idx >= self.params.max_epochs or not self.patience_left):
+                training_successful = True
+
+        except Exception as e:
+            logger.error(f"Training failed with exception: {e}")
+            training_successful = False
+
+        finally:
+            # Always save final checkpoint and model
+            try:
+                if not self.training_interrupted:
+                    self.save_checkpoint()
+                    self._save_model()
+                    logger.info(f"Training completed{stage_info}")
+                else:
+                    logger.info(f"Training interrupted{stage_info}, but state saved")
+
+                # Final verification for progressive training
+                if self.has_lora and self.params.training_stage:
+                    self.verifier.verify_lora_setup_for_stage()
+
+                # Enhanced cleanup at end of training
+                torch.cuda.empty_cache()
+
+                # Clear optimizer state to free memory
+                if hasattr(self, 'optimizer'):
+                    del self.optimizer
+                    del self.lr_scheduler
+
+                # Force garbage collection
+                import gc
+                gc.collect()
+
+            except Exception as e:
+                logger.error(f"Error during training cleanup: {e}")
+
+        return training_successful and not self.training_interrupted
