@@ -29,6 +29,7 @@ from seamless_communication.models.unity import (
     UnitYT2UModel,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -457,6 +458,7 @@ class UnitYFinetune:
 
     def _train_step(self, batch: dataloader.MultimodalSeqsBatch) -> None:
         """Enhanced train step with loss debugging"""
+
         self.model.train()
 
         accum_steps = max(1, getattr(self.params, "grad_accum_steps", 1))
