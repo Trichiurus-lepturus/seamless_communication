@@ -96,7 +96,7 @@ class FinetuneParams:
 
 
 class CheckpointManager:
-    """Manages checkpoint saving/loading with error recovery"""
+    """FIXED: Manages checkpoint saving/loading with error recovery"""
 
     def __init__(self, save_dir: Path, training_stage: Optional[str] = None):
         self.save_dir = Path(save_dir)
@@ -117,54 +117,36 @@ class CheckpointManager:
         stage_prefix = f"{self.training_stage}_" if self.training_stage else ""
         return self.checkpoint_dir / f"{stage_prefix}checkpoint_step_{step}.pt"
 
-    def _get_lora_state_dict(self) -> Dict[str, torch.Tensor]:
-        """Extract only LoRA adapter weights"""
-        lora_state = {}
-        for name, module in self.model.named_modules():
-            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                lora_state[f"{name}.lora_A"] = module.lora_A.cpu()
-                lora_state[f"{name}.lora_B"] = module.lora_B.cpu()
-        return lora_state
-
-    def save_checkpoint(self) -> bool:
-        """Save training checkpoint with LoRA-aware state"""
+    def save_checkpoint(self, checkpoint_state: Dict[str, Any], step: int) -> bool:
+        """FIXED: Save checkpoint with proper error handling"""
         try:
-            if self.has_lora:
-                # For LoRA training: Save only LoRA state + minimal training state
-                checkpoint_state = {
-                    'epoch': self.epoch_idx,
-                    'update_idx': self.update_idx,
-                    'best_eval_loss': self.best_eval_loss,
-                    'training_stage': self.params.training_stage,
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
-                    'lora_state_dict': self._get_lora_state_dict(),  # Only LoRA weights
-                    'completed': False
-                }
-            else:
-                # For full model training: Save complete state
-                checkpoint_state = {
-                    'epoch': self.epoch_idx,
-                    'update_idx': self.update_idx,
-                    'model_state_dict': self.model.state_dict(),  # Full model - only for non-LoRA
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
-                    'best_eval_loss': self.best_eval_loss,
-                    'training_stage': self.params.training_stage,
-                    'completed': False
-                }
+            checkpoint_path = self.get_checkpoint_path(step)
 
-            # Add RNG states
-            checkpoint_state['random_state'] = random.getstate()
-            checkpoint_state['numpy_random_state'] = np.random.get_state()
-            checkpoint_state['torch_random_state'] = torch.get_rng_state()
-            if torch.cuda.is_available():
-                checkpoint_state['cuda_random_state'] = torch.cuda.get_rng_state()
+            # Add completion status
+            checkpoint_state['completed'] = False
+            checkpoint_state['checkpoint_step'] = step
+            checkpoint_state['training_stage'] = self.training_stage
 
-            success = self.checkpoint_manager.save_checkpoint(checkpoint_state, self.update_idx)
-            if success:
-                self.last_checkpoint_step = self.update_idx
-            return success
+            # Save checkpoint
+            torch.save(checkpoint_state, checkpoint_path)
+
+            # Update latest checkpoint info
+            latest_info = {
+                'latest_checkpoint': str(checkpoint_path),
+                'checkpoint_step': step,
+                'training_stage': self.training_stage,
+                'timestamp': time.time()
+            }
+
+            with open(self.latest_checkpoint_path, 'w') as f:
+                json.dump(latest_info, f, indent=2)
+
+            logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+            # Cleanup old checkpoints
+            self._cleanup_old_checkpoints()
+
+            return True
 
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
@@ -184,7 +166,7 @@ class CheckpointManager:
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
             # Verify checkpoint integrity
-            required_keys = ['epoch', 'update_idx', 'model_state_dict']
+            required_keys = ['epoch', 'update_idx']
             if not all(key in checkpoint for key in required_keys):
                 logger.warning(f"Checkpoint missing required keys: {checkpoint_path}")
                 return None
@@ -239,7 +221,8 @@ class CheckpointManager:
                 'step': step,
                 'emergency_save': True,
                 'training_stage': self.training_stage,
-                'timestamp': time.time()
+                'timestamp': time.time(),
+                'completed': False
             }
 
             torch.save(state_dict, self.emergency_checkpoint_path)
@@ -529,11 +512,6 @@ class UnitYFinetune:
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
 
-        # Verify LoRA setup for current stage
-        if self.has_lora and self.params.training_stage:
-            if not self.verifier.verify_lora_setup_for_stage():
-                logger.warning(f"LoRA setup may not match expected stage: {self.params.training_stage}")
-
         # Only apply freeze_modules if we're NOT using LoRA (since LoRA handles freezing)
         if freeze_modules and not self.has_lora:
             logger.info("Applying additional module freezing...")
@@ -546,9 +524,16 @@ class UnitYFinetune:
 
         self.grad_scaler = torch.cuda.amp.GradScaler()
 
-        # CRITICAL: Only optimize parameters that require gradients
+        # Only optimize parameters that require gradients
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         logger.info(f"Optimizer will train {len(trainable_params)} parameter tensors")
+
+        if len(trainable_params) == 0:
+            # ENHANCED: More detailed error message
+            logger.error("No trainable parameters found!")
+            logger.error("This likely means LoRA modules were not activated before creating the trainer.")
+            logger.error("Check that activate_lora_for_stage() was called before UnitYFinetune.__init__()")
+            raise RuntimeError("No trainable parameters found! Check LoRA implementation.")
 
         if len(trainable_params) == 0:
             raise RuntimeError("No trainable parameters found! Check LoRA implementation.")
@@ -592,6 +577,12 @@ class UnitYFinetune:
 
         # Log training setup
         self._log_training_setup()
+
+        # Verify LoRA setup for current stage
+        if self.has_lora and self.params.training_stage:
+            if not self.verifier.verify_lora_setup_for_stage():
+                logger.warning(f"LoRA setup may not match expected stage: {self.params.training_stage}")
+
 
     def update_training_stage(self, new_stage: str):
         """Update training stage and reconfigure optimizer"""
@@ -914,12 +905,12 @@ class UnitYFinetune:
             # Restore model state first
             self.model.load_state_dict(checkpoint['model_state_dict'])
 
-            # CRITICAL FIX: Reactivate LoRA for current stage BEFORE updating optimizer
+            # Reactivate LoRA for current stage BEFORE updating optimizer
             if self.has_lora and self.params.training_stage:
                 logger.info(f"Reactivating LoRA modules for stage: {self.params.training_stage}")
 
                 # Import here to avoid circular imports
-                from .finetune import activate_lora_for_stage
+                from seamless_communication.cli.m4t.finetune import activate_lora_for_stage
                 activated = activate_lora_for_stage(self.model, self.params.training_stage)
                 logger.info(f"Reactivated {activated} LoRA modules for stage: {self.params.training_stage}")
 

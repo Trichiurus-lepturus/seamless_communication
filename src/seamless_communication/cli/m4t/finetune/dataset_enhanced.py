@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Enhanced multilingual FLEURS manifest builder with deduplication and caching.
-Drop-in replacement for dataset_multi.py with better efficiency.
 """
 import argparse
 import dataclasses
@@ -385,7 +384,6 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Enhanced multilingual FLEURS manifest builder with deduplication and caching. "
-            "Drop-in replacement for dataset_multi.py."
         )
     )
     parser.add_argument("--split", type=str, required=True, help="train / validation / test")

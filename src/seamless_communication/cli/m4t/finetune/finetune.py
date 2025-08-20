@@ -17,7 +17,6 @@ from seamless_communication.models.unity import (
     load_unity_unit_tokenizer,
 )
 
-from seamless_communication.cli.m4t.finetune.dataloader_augmented import create_compatible_dataloader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,29 +24,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("finetune")
-
-
-def get_optimal_num_workers() -> int:
-    """Automatically determine optimal num_workers based on setup"""
-
-    # Check if we're in distributed mode
-    if dist.is_available() and dist.is_initialized():
-        world_size = dist.get_world_size()
-        if world_size == 1:
-            return 0  # Single GPU - disable workers to avoid .throw() error
-        else:
-            return 2  # Multi-GPU - can use workers
-
-    # Check total available GPUs
-    elif torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        if gpu_count == 1:
-            return 0  # Single GPU
-        else:
-            return min(2, gpu_count)  # Multi-GPU
-
-    else:
-        return 0  # CPU training - no workers needed
 
 
 class LoRALinear(nn.Module):
@@ -226,51 +202,73 @@ def apply_lora_to_model(model, target_modules=None, r=4, lora_alpha=16, lora_dro
 
 
 def activate_lora_for_stage(model, stage: str):
-    """Activate specific LoRA modules based on training stage"""
+    """FIXED: Activate specific LoRA modules based on training stage"""
 
     # First, deactivate all LoRA modules
+    deactivated_count = 0
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
             module.deactivate()
+            deactivated_count += 1
+
+    logger.info(f"Deactivated {deactivated_count} LoRA modules")
 
     # Then activate modules for the current stage
     activated_count = 0
 
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
-            # CRITICAL FIX: Don't modify the module path since we replaced the entire module
             module_path = name
 
             if stage == "speech_encoder":
-                if 'speech_encoder.inner.layers.' in module_path:
-                    module.activate()
-                    activated_count += 1
+                # FIXED: Only activate speech encoder LoRA modules
+                if 'speech_encoder' in module_path and 'inner.layers.' in module_path:
+                    # Focus on higher layers for better efficiency
+                    if any(f'layers.{i}.' in module_path for i in [9, 10, 11]):
+                        if any(comp in module_path for comp in ['self_attn', 'ffn1', 'ffn2']):
+                            module.activate()
+                            activated_count += 1
+                            logger.debug(f"Activated speech encoder LoRA: {module_path}")
 
             elif stage == "text_decoder":
-                if 'text_decoder.layers.' in module_path:
-                    module.activate()
-                    activated_count += 1
+                # FIXED: Only activate text decoder LoRA modules
+                if 'text_decoder' in module_path and 'layers.' in module_path:
+                    # Focus on higher layers
+                    if any(f'layers.{i}.' in module_path for i in [9, 10, 11]):
+                        if any(comp in module_path for comp in ['self_attn', 'encoder_decoder_attn', 'ffn']):
+                            module.activate()
+                            activated_count += 1
+                            logger.debug(f"Activated text decoder LoRA: {module_path}")
 
             elif stage == "full":
-                # More selective activation for full stage
-                if ('speech_encoder.inner.layers.' in module_path and
-                    any(f'layers.{i}.' in module_path for i in [10, 11]) and
-                    ('self_attn' in module_path or 'ffn2' in module_path)):
+                # FIXED: Activate both speech encoder and text decoder (selective)
+                activated_this_module = False
+
+                # Speech encoder (selective activation)
+                if ('speech_encoder' in module_path and 'inner.layers.' in module_path and
+                        any(f'layers.{i}.' in module_path for i in [10, 11]) and
+                        ('self_attn' in module_path or 'ffn2' in module_path)):
                     module.activate()
-                    activated_count += 1
-                elif ('text_decoder.layers.' in module_path and
-                      'encoder_decoder_attn' in module_path and
-                      any(f'layers.{i}.' in module_path for i in [10, 11])):
+                    activated_this_module = True
+
+                # Text decoder (selective activation)
+                elif ('text_decoder' in module_path and 'layers.' in module_path and
+                      any(f'layers.{i}.' in module_path for i in [10, 11]) and
+                      'encoder_decoder_attn' in module_path):
                     module.activate()
+                    activated_this_module = True
+
+                if activated_this_module:
                     activated_count += 1
+                    logger.debug(f"Activated full stage LoRA: {module_path}")
 
             elif stage == "conservative":
-                # Original conservative approach
-                if ('speech_encoder.inner.layers.' in module_path and
-                    any(f'layers.{i}.' in module_path for i in [9, 10, 11])):
+                # Original conservative approach (unchanged)
+                if ('speech_encoder' in module_path and 'inner.layers.' in module_path and
+                        any(f'layers.{i}.' in module_path for i in [9, 10, 11])):
                     module.activate()
                     activated_count += 1
-                elif ('text_decoder.layers.' in module_path and
+                elif ('text_decoder' in module_path and 'layers.' in module_path and
                       'encoder_decoder_attn' in module_path and
                       any(f'layers.{i}.' in module_path for i in [8, 9, 10, 11]) and
                       any(proj in module_path for proj in ['q_proj', 'k_proj', 'v_proj'])):
@@ -412,63 +410,86 @@ def verify_stage_prerequisites(stage: str, output_dir: Path, save_model_to: Path
     return True
 
 
+def get_optimal_num_workers() -> int:
+    """Automatically determine optimal num_workers based on setup"""
+
+    # Check if we're in distributed mode
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return 0  # Single GPU - disable workers to avoid .throw() error
+        else:
+            return 2  # Multi-GPU - can use workers
+
+    # Check total available GPUs
+    elif torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 1:
+            return 0  # Single GPU
+        else:
+            return min(2, gpu_count)  # Multi-GPU
+
+    else:
+        return 0  # CPU training - no workers needed
+
+
 def create_dataloader_with_augmentation(
-    text_tokenizer,
-    unit_tokenizer,
-    dataset_manifest_path: Path,
-    batching_config: dataloader.BatchingConfig,
-    max_src_tokens_per_batch: int,
-    training_stage: str = "none",
-    is_training: bool = True
+        text_tokenizer,
+        unit_tokenizer,
+        dataset_manifest_path: Path,
+        batching_config: BatchingConfig,
+        max_src_tokens_per_batch: int,
+        training_stage: str = "none",
+        is_training: bool = True
 ):
-    """Create dataloader with appropriate augmentation for the training stage"""
+    """FIXED: Create dataloader - now properly handles stage-specific datasets"""
 
-    # Import the enhanced dataloader if available, otherwise fall back to original
+    # For training, try to use stage-specific dataset if available
+    if is_training and training_stage != "conservative" and training_stage != "none":
+
+        # Check for stage-specific dataset (from your new data preparation)
+        manifest_dir = dataset_manifest_path.parent
+
+        # Look for stage-specific dataset
+        stage_dataset_path = manifest_dir / f"train_{training_stage}_dataset.json"
+
+        if stage_dataset_path.exists():
+            logger.info(f"Using stage-specific dataset: {stage_dataset_path}")
+            dataset_manifest_path = stage_dataset_path
+        else:
+            logger.warning(f"Stage-specific dataset not found: {stage_dataset_path}")
+            logger.info("Falling back to original manifest")
+
+    # FIXED: Use simple dataloader with proper num_workers handling
     try:
-        augmentation_config = None
-        if training_stage != "conservative" and training_stage != "none":
-            stage_map = {
-                "speech_encoder": "audio_only",
-                "text_decoder": "text_only",
-                "full": "both"
-            }
-
-            augmentation_config = {
-                "stage": stage_map.get(training_stage, "none"),
-                "augmentation_prob": 0.20,
-                "audio_config": {
-                    "techniques_per_sample": (1, 1)
-                },
-                "text_config": {
-                    "techniques_per_sample": (1, 2)
-                }
-            }
-
-            logger.info(f"Creating dataloader with {stage_map.get(training_stage, 'none')} augmentation for stage: {training_stage}")
+        from seamless_communication.cli.m4t.finetune.dataloader_simple import create_simple_dataloader
 
         optimal_num_workers = get_optimal_num_workers()
-        logger.info(f"Using num_workers={optimal_num_workers} for dataloader")
+        logger.info(f"Using num_workers={optimal_num_workers} for simple dataloader")
 
-        return create_compatible_dataloader(
+        return create_simple_dataloader(
             text_tokenizer=text_tokenizer,
             unit_tokenizer=unit_tokenizer,
             dataset_manifest_path=str(dataset_manifest_path),
             batching_config=batching_config,
             max_src_tokens_per_batch=max_src_tokens_per_batch,
-            augmentation_config=augmentation_config,
-            is_training=is_training,
             num_workers=optimal_num_workers
         )
 
-    except ImportError as e:
-        logger.warning(f"Failed to import augmented dataloader: {e}")
-        logger.info("Using standard dataloader as fallback")
+    except ImportError:
+        # Fallback to original dataloader
+        logger.info("Simple dataloader not available, using original dataloader")
+
+        # FIXED: Update the batching config num_workers for original dataloader too
+        import copy
+        updated_config = copy.deepcopy(batching_config)
+        updated_config.num_workers = get_optimal_num_workers()
 
         return dataloader.UnitYDataLoader(
             text_tokenizer=text_tokenizer,
             unit_tokenizer=unit_tokenizer,
-            batching_config=batching_config,
-            dataset_manifest_path=dataset_manifest_path,
+            batching_config=updated_config,
+            dataset_manifest_path=str(dataset_manifest_path),
             max_src_tokens_per_batch=max_src_tokens_per_batch
         )
 
@@ -678,10 +699,20 @@ def run_single_stage(args, stage: str, epochs: int, previous_stage_path: Optiona
         text_tokenizer = load_unity_text_tokenizer(args.model_name)
         unit_tokenizer = load_unity_unit_tokenizer(args.model_name)
 
+        # Determine finetune mode based on stage
+        if stage == "speech_encoder":
+            finetune_mode = trainer.FinetuneMode.SPEECH_TO_TEXT
+        elif stage == "text_decoder":
+            finetune_mode = trainer.FinetuneMode.SPEECH_TO_TEXT
+        elif stage == "full":
+            finetune_mode = trainer.FinetuneMode.SPEECH_TO_TEXT
+        else:
+            finetune_mode = args.mode  # Conservative/default
+
         # Create finetune params with error recovery support
         finetune_params = trainer.FinetuneParams(
             model_name=args.model_name,
-            finetune_mode=args.mode,
+            finetune_mode=finetune_mode,
             save_model_path=args.save_model_to,
             device=torch.device(args.device),
             float_dtype=float_dtype,
@@ -713,7 +744,11 @@ def run_single_stage(args, stage: str, epochs: int, previous_stage_path: Optiona
             model.t2u_model = None
 
         if model.text_encoder is not None:
-            model.text_encoder = None
+            # Keep text encoder but freeze it completely
+            for param in model.text_encoder.parameters():
+                param.requires_grad = False
+            model.text_encoder.eval()
+            logger.info("Text encoder frozen")
 
         # Apply LoRA to all potential target modules (initially inactive)
         logger.info("Applying LoRA to all target modules...")
@@ -725,11 +760,14 @@ def run_single_stage(args, stage: str, epochs: int, previous_stage_path: Optiona
             lora_dropout=args.lora_dropout
         )
 
+        if len(lora_modules) == 0:
+            raise RuntimeError("No LoRA modules were applied to the model!")
+
         # Load previous stage weights if available
         if previous_stage_path and stage != "speech_encoder":
             load_previous_stage_lora(model, previous_stage_path)
 
-        # Activate LoRA modules for the current stage
+        # Activate LoRA modules for the current stage BEFORE creating trainer
         logger.info(f"Activating LoRA modules for stage: {stage}")
         active_count = activate_lora_for_stage(model, stage)
 
@@ -783,7 +821,7 @@ def run_single_stage(args, stage: str, epochs: int, previous_stage_path: Optiona
             is_training=False  # Never augment validation data
         )
 
-        # Create trainer and run
+        # Create trainer AFTER LoRA activation, so optimizer gets correct parameters
         finetune = trainer.UnitYFinetune(
             model=model,
             params=finetune_params,
