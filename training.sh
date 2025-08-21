@@ -34,6 +34,9 @@ EVAL_DATASET="$DATASET_SAVE_DIR/validation_all_pairs_manifest.json"
 OUTPUT_DIR="$DATASET_SAVE_DIR/progressive_training"
 LOG_DIR="$OUTPUT_DIR/logs"
 
+# NEW: Global flag for skipping data preparation
+SKIP_DATA_PREP=false
+
 # Training Hyperparameters
 LEARNING_RATE="5e-5"
 WARMUP_STEPS="200"
@@ -111,6 +114,33 @@ check_dataset_exists() {
     fi
 }
 
+# NEW: Check if augmentation pool exists
+check_augmentation_pool_exists() {
+    local augmented_pool="$DATASET_SAVE_DIR/train_audio_augmented_pool.json"
+    if [ -f "$augmented_pool" ]; then
+        local sample_count=$(wc -l < "$augmented_pool")
+        print_status "SUCCESS" "Augmentation pool found ($sample_count samples)"
+        return 0
+    else
+        print_status "INFO" "Augmentation pool not found"
+        return 1
+    fi
+}
+
+# NEW: Check if stage checkpoint exists
+check_stage_checkpoint() {
+    local stage="$1"
+    local checkpoint_path="$OUTPUT_DIR/checkpoint_${stage}.pt"
+
+    if [ -f "$checkpoint_path" ]; then
+        print_status "SUCCESS" "Found checkpoint for $stage stage: $(basename "$checkpoint_path")"
+        return 0
+    else
+        print_status "INFO" "No checkpoint found for $stage stage"
+        return 1
+    fi
+}
+
 #==============================================================================
 # Dataset Generation Functions
 #==============================================================================
@@ -173,6 +203,12 @@ generate_augmented_audio_pool() {
     print_banner "AUDIO AUGMENTATION POOL"
     print_status "INFO" "Creating comprehensive audio augmentation pool (3:1 ratio)..."
 
+    # NEW: Check if already exists
+    if check_augmentation_pool_exists; then
+        print_status "INFO" "Augmentation pool already exists, skipping generation"
+        return 0
+    fi
+
     source "$VENV_PATH/bin/activate"
 
     if [ ! -f "src/seamless_communication/cli/m4t/finetune/preprocess_augmentation.py" ]; then
@@ -220,8 +256,24 @@ create_stage_datasets() {
         return 0
     fi
 
-    # Create stage-specific datasets with 3:1 ratio
+    # NEW: Check if stage datasets already exist
     local stages=("speech_encoder" "text_decoder" "full")
+    local all_exist=true
+
+    for stage in "${stages[@]}"; do
+        local output_manifest="$DATASET_SAVE_DIR/train_${stage}_dataset.json"
+        if [ ! -f "$output_manifest" ]; then
+            all_exist=false
+            break
+        fi
+    done
+
+    if [ "$all_exist" = true ]; then
+        print_status "INFO" "All stage datasets already exist, skipping creation"
+        return 0
+    fi
+
+    # Create stage-specific datasets with 3:1 ratio
     local variant_seeds=(100 200 300)  # Different seeds for different variants
 
     for i in "${!stages[@]}"; do
@@ -229,8 +281,14 @@ create_stage_datasets() {
         local seed="${variant_seeds[$i]}"
         local output_manifest="$DATASET_SAVE_DIR/train_${stage}_dataset.json"
 
+        if [ -f "$output_manifest" ]; then
+            print_status "INFO" "$stage dataset already exists, skipping"
+            continue
+        fi
+
         print_status "INFO" "Creating dataset for $stage stage (3:1 ratio, seed: $seed)..."
 
+        # NEW: Use direct script execution to avoid import issues
         if python src/seamless_communication/cli/m4t/finetune/create_stage_dataset.py \
             --input_manifest "$base_manifest" \
             --output_manifest "$output_manifest" \
@@ -259,40 +317,32 @@ generate_augmented_datasets() {
     return 0
 }
 
-# Update select_training_dataset function:
+# UPDATED: select_training_dataset function aligned with working manual approach
 select_training_dataset() {
     local stage="$1"
     local base_dataset="$TRAIN_DATASET"
     local dataset_dir=$(dirname "$base_dataset")
     local selected_dataset="$base_dataset"
 
+    # PRIORITY: Use augmentation pool for all stages (like the working manual command)
+    local augmented_pool="$dataset_dir/train_audio_augmented_pool.json"
+
+    if [ -f "$augmented_pool" ]; then
+        selected_dataset="$augmented_pool"
+        print_status "INFO" "Using augmentation pool for $stage stage (595M, 3:1 ratio)"
+        echo "$selected_dataset"
+        return 0
+    fi
+
+    # Fallback to stage-specific datasets
     case $stage in
-        "speech_encoder")
-            # Look for stage-specific dataset (from your new augmentation strategy)
-            local stage_dataset="$dataset_dir/train_speech_encoder_dataset.json"
+        "speech_encoder"|"text_decoder"|"full")
+            local stage_dataset="$dataset_dir/train_${stage}_dataset.json"
             if [ -f "$stage_dataset" ]; then
                 selected_dataset="$stage_dataset"
-                print_status "INFO" "Using speech_encoder dataset (3:1 ratio, variant A)"
+                print_status "INFO" "Using $stage dataset (stage-specific)"
             else
-                print_status "WARN" "Stage-specific dataset not found, using original"
-            fi
-            ;;
-        "text_decoder")
-            local stage_dataset="$dataset_dir/train_text_decoder_dataset.json"
-            if [ -f "$stage_dataset" ]; then
-                selected_dataset="$stage_dataset"
-                print_status "INFO" "Using text_decoder dataset (3:1 ratio, variant B)"
-            else
-                print_status "WARN" "Stage-specific dataset not found, using original"
-            fi
-            ;;
-        "full")
-            local stage_dataset="$dataset_dir/train_full_dataset.json"
-            if [ -f "$stage_dataset" ]; then
-                selected_dataset="$stage_dataset"
-                print_status "INFO" "Using full stage dataset (3:1 ratio, variant C)"
-            else
-                print_status "WARN" "Stage-specific dataset not found, using original"
+                print_status "WARN" "Stage-specific dataset not found for $stage, using original"
             fi
             ;;
         *)
@@ -303,6 +353,7 @@ select_training_dataset() {
     echo "$selected_dataset"
 }
 
+# UPDATED: run_training_stage function aligned with working manual approach
 run_training_stage() {
     local stage="$1"
     local epochs="$2"
@@ -310,6 +361,23 @@ run_training_stage() {
 
     print_banner "TRAINING STAGE: $(echo $stage | tr '[:lower:]' '[:upper:]')"
     print_status "INFO" "Stage: $stage | Epochs: $epochs | Log: $log_suffix"
+
+    # Check prerequisites for progressive stages
+    case $stage in
+        "text_decoder")
+            if ! check_stage_checkpoint "speech_encoder"; then
+                print_status "ERROR" "text_decoder stage requires speech_encoder checkpoint"
+                print_status "INFO" "Run: ./training.sh --skip-data-prep single speech_encoder"
+                return 1
+            fi
+            ;;
+        "full")
+            if ! check_stage_checkpoint "speech_encoder" || ! check_stage_checkpoint "text_decoder"; then
+                print_status "WARN" "full stage typically requires previous checkpoints"
+                print_status "INFO" "Missing checkpoints - training from scratch"
+            fi
+            ;;
+    esac
 
     # Select appropriate dataset
     local selected_dataset=$(select_training_dataset "$stage")
@@ -324,7 +392,13 @@ run_training_stage() {
     # Validate datasets
     if [ ! -f "$selected_dataset" ]; then
         print_status "ERROR" "Training dataset not found: $selected_dataset"
-        return 1
+        print_status "INFO" "Using original dataset for $stage stage"
+        selected_dataset="$TRAIN_DATASET"
+
+        if [ ! -f "$selected_dataset" ]; then
+            print_status "ERROR" "Original training dataset also not found: $selected_dataset"
+            return 1
+        fi
     fi
 
     if [ ! -f "$EVAL_DATASET" ]; then
@@ -335,11 +409,13 @@ run_training_stage() {
     # Source environment
     source "$VENV_PATH/bin/activate"
 
-    # Build torchrun command
+    # Build save path
     local save_model_path="$OUTPUT_DIR/checkpoint_${stage}.pt"
 
     print_status "INFO" "Starting torchrun for stage: $stage"
+    print_status "INFO" "Model will be saved to: $save_model_path"
 
+    # FIXED: Use the same parameters as the working manual command
     torchrun \
         --rdzv-backend=c10d \
         --rdzv-endpoint=localhost:0 \
@@ -373,6 +449,7 @@ run_training_stage() {
     case $exit_code in
         0)
             print_status "SUCCESS" "Stage $stage completed successfully"
+            print_status "INFO" "Checkpoint saved: $save_model_path"
             return 0
             ;;
         130)
@@ -386,62 +463,36 @@ run_training_stage() {
     esac
 }
 
+# UPDATED: run_progressive_training function
 run_progressive_training() {
     print_banner "PROGRESSIVE TRAINING PIPELINE"
-    print_status "INFO" "Starting full progressive training pipeline"
+    print_status "INFO" "Starting sequential progressive training stages"
 
-    local save_model_path="$OUTPUT_DIR/checkpoint_progressive.pt"
-    local log_file="$LOG_DIR/train_progressive_full.log"
+    # Run stages in sequence: speech_encoder -> text_decoder -> full
+    local stages=("speech_encoder" "text_decoder" "full")
+    local epochs=(3 3 4)
+    local exit_code=0
 
-    mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
-    source "$VENV_PATH/bin/activate"
+    for i in "${!stages[@]}"; do
+        local stage="${stages[$i]}"
+        local epoch_count="${epochs[$i]}"
 
-    print_status "INFO" "Log file: $log_file"
+        print_status "INFO" "Starting progressive stage $((i+1))/3: $stage"
 
-    torchrun \
-        --rdzv-backend=c10d \
-        --rdzv-endpoint=localhost:0 \
-        --nnodes=1 \
-        --nproc-per-node=1 \
-        --no-python \
-        m4t_finetune \
-            --mode SPEECH_TO_TEXT \
-            --train_dataset "$TRAIN_DATASET" \
-            --eval_dataset "$EVAL_DATASET" \
-            --learning_rate "$LEARNING_RATE" \
-            --warmup_steps "$WARMUP_STEPS" \
-            --batch_size "$BATCH_SIZE" \
-            --grad_accum_steps "$GRAD_ACCUM_STEPS" \
-            --max_src_tokens "$MAX_SRC_TOKENS" \
-            --eval_steps "$EVAL_STEPS" \
-            --patience "$PATIENCE" \
-            --log_steps "$LOG_STEPS" \
-            --model_name "$MODEL_NAME" \
-            --save_model_to "$save_model_path" \
-            --lora_r "$LORA_R" \
-            --lora_alpha "$LORA_ALPHA" \
-            --lora_dropout "$LORA_DROPOUT" \
-            --progressive \
-            --stage_epochs 3 3 4 \
-            --checkpoint_steps "$CHECKPOINT_STEPS" \
-        2>&1 | tee "$log_file"
+        if ! run_training_stage "$stage" "$epoch_count" "progressive"; then
+            print_status "ERROR" "Progressive stage $stage failed, stopping pipeline"
+            exit_code=1
+            break
+        fi
 
-    local exit_code=${PIPESTATUS[0]}
+        print_status "SUCCESS" "Progressive stage $stage completed"
+    done
 
-    case $exit_code in
-        0)
-            print_status "SUCCESS" "Progressive training completed successfully"
-            return 0
-            ;;
-        130)
-            print_status "WARN" "Progressive training interrupted by user"
-            return 130
-            ;;
-        *)
-            print_status "ERROR" "Progressive training failed with exit code $exit_code"
-            return $exit_code
-            ;;
-    esac
+    if [ $exit_code -eq 0 ]; then
+        print_status "SUCCESS" "All progressive training stages completed successfully"
+    fi
+
+    return $exit_code
 }
 
 resume_training() {
@@ -572,11 +623,23 @@ generate_training_summary() {
     fi
 
     echo ""
-    if [ -d "$DATASET_SAVE_DIR/cache" ]; then
-        echo "Cache Statistics:"
-        echo "  Cache directory size: $(du -sh "$DATASET_SAVE_DIR/cache" 2>/dev/null | cut -f1 || echo 'N/A')"
-        echo "  Audio cache files: $(find "$DATASET_SAVE_DIR/cache/audio_cache" -name "*.pt" 2>/dev/null | wc -l || echo '0')"
-        echo "  Text cache files: $(find "$DATASET_SAVE_DIR/cache/text_cache" -name "*.json" 2>/dev/null | wc -l || echo '0')"
+    echo "Next Steps for Progressive Training:"
+    if check_stage_checkpoint "speech_encoder"; then
+        echo "  ✅ Speech encoder checkpoint ready"
+    else
+        echo "  ❌ Missing speech encoder checkpoint"
+    fi
+
+    if check_stage_checkpoint "text_decoder"; then
+        echo "  ✅ Text decoder checkpoint ready"
+    else
+        echo "  ❌ Missing text decoder checkpoint - run: ./training.sh --skip-data-prep single text_decoder"
+    fi
+
+    if check_stage_checkpoint "full"; then
+        echo "  ✅ Full model checkpoint ready"
+    else
+        echo "  ❌ Missing full model checkpoint - run: ./training.sh --skip-data-prep single full"
     fi
 
     echo ""
@@ -585,27 +648,31 @@ generate_training_summary() {
 
 print_usage() {
     cat << 'EOF'
-Usage: ./training.sh [MODE] [STAGE]
+Usage: ./training.sh [OPTIONS] [MODE] [STAGE]
+
+OPTIONS:
+    --skip-data-prep    Skip dataset generation and augmentation (use existing data)
+    -h, --help         Show this help message
 
 MODES:
-    progressive     Run full progressive training pipeline (default)
+    progressive     Run sequential progressive training (speech_encoder -> text_decoder -> full)
     single         Run single stage training
-    stages         Run individual stages sequentially
+    stages         Run individual stages sequentially (same as progressive)
     resume         Resume interrupted training
     test           Test conservative mode
 
 STAGES (for single/resume modes):
-    speech_encoder  Train speech encoder with audio augmentation
-    text_decoder    Train text decoder with text augmentation
-    full           Train both components with light augmentation
+    speech_encoder  Train speech encoder (no prerequisites)
+    text_decoder    Train text decoder (requires speech_encoder checkpoint)
+    full           Train full model (works best with previous checkpoints)
     conservative   Original training behavior
 
 EXAMPLES:
-    ./training.sh                           # Progressive training (default)
-    ./training.sh progressive               # Same as above
-    ./training.sh single speech_encoder     # Train only speech encoder
-    ./training.sh resume text_decoder       # Resume text decoder training
-    ./training.sh test                      # Quick test run
+    ./training.sh --skip-data-prep single speech_encoder    # Start progressive training (Stage 1)
+    ./training.sh --skip-data-prep single text_decoder      # Continue progressive training (Stage 2)
+    ./training.sh --skip-data-prep single full              # Complete progressive training (Stage 3)
+    ./training.sh --skip-data-prep progressive              # Run all stages sequentially
+    ./training.sh resume text_decoder                       # Resume interrupted training
 
 EOF
 }
@@ -623,6 +690,22 @@ setup_environment() {
         return 1
     fi
 
+    # NEW: Check if we should skip data preparation
+    if [ "$SKIP_DATA_PREP" = true ]; then
+        print_status "INFO" "Skipping data preparation (--skip-data-prep flag)"
+
+        # Verify required datasets exist
+        if ! check_dataset_exists; then
+            print_status "ERROR" "Original datasets not found, cannot skip data preparation"
+            return 1
+        fi
+
+        # Check if augmentation pool exists (optional)
+        check_augmentation_pool_exists || print_status "INFO" "No augmentation pool, will use original datasets"
+
+        return 0
+    fi
+
     # Setup datasets
     if ! check_dataset_exists; then
         if ! generate_original_datasets; then
@@ -637,19 +720,46 @@ setup_environment() {
     return 0
 }
 
+# NEW: Parse arguments with support for --skip-data-prep
+parse_arguments() {
+    local args=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --skip-data-prep)
+                SKIP_DATA_PREP=true
+                shift
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Return remaining arguments
+    echo "${args[@]}"
+}
+
 main() {
-    # Handle help/usage
-    if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
-        print_usage
-        exit 0
-    fi
+    # NEW: Parse arguments first
+    local remaining_args=($(parse_arguments "$@"))
 
     # Setup trap for interruption handling
     trap 'echo ""; print_status "WARN" "Training interrupted. Checkpoints saved."; exit 130' INT TERM
 
-    # Parse arguments
-    local training_mode="${1:-progressive}"
-    local specific_stage="${2:-}"
+    # Parse remaining arguments
+    local training_mode="${remaining_args[0]:-progressive}"
+    local specific_stage="${remaining_args[1]:-}"
+
+    # NEW: Display skip data prep status
+    if [ "$SKIP_DATA_PREP" = true ]; then
+        print_status "INFO" "Data preparation will be skipped"
+    fi
 
     # Setup environment and datasets
     if ! setup_environment; then
@@ -661,8 +771,8 @@ main() {
 
     # Execute training based on mode
     case $training_mode in
-        "progressive")
-            print_status "INFO" "Running full progressive training pipeline"
+        "progressive"|"stages")
+            print_status "INFO" "Running sequential progressive training pipeline"
             run_progressive_training
             exit_code=$?
             ;;
@@ -676,27 +786,6 @@ main() {
             print_status "INFO" "Running single stage training: $specific_stage"
             run_training_stage "$specific_stage" 10 "single"
             exit_code=$?
-            ;;
-
-        "stages")
-            print_status "INFO" "Running individual stages sequentially"
-            local stages=("speech_encoder" "text_decoder" "full")
-            local epochs=(3 3 4)
-
-            for i in "${!stages[@]}"; do
-                local stage="${stages[$i]}"
-                local epoch_count="${epochs[$i]}"
-
-                if ! run_training_stage "$stage" "$epoch_count" "individual"; then
-                    print_status "ERROR" "$stage stage failed, stopping pipeline"
-                    exit_code=1
-                    break
-                fi
-            done
-
-            if [ $exit_code -eq 0 ]; then
-                print_status "SUCCESS" "All individual stages completed successfully"
-            fi
             ;;
 
         "resume")
